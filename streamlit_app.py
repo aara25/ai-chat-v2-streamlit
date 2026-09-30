@@ -21,30 +21,17 @@ insight) rendered underneath, matching the shared Evidence schema in
 app/schemas/evidence.py.
 
 Run with: streamlit run streamlit_app.py
-Point it at the deployed ai_chat_v2 Cloud Function via the AI_CHAT_V2_API_URL
-Streamlit secret or env var, or the "API connection" field on the sign-in page
-(defaults to http://localhost:8080, i.e. `functions-framework
---target=ai_chat_v2 --debug` running locally in the backend repo).
+Talks to the deployed ai_chat_v2 Cloud Function at API_URL below.
 """
 from __future__ import annotations
 
 import json
-import os
 import time
 
 import requests
 import streamlit as st
 
-def read_default_api_url() -> str:
-    """Streamlit Cloud secret first (a hosted app can't reach localhost), then
-    the AI_CHAT_V2_API_URL env var, then a local functions-framework."""
-    try:
-        return st.secrets["AI_CHAT_V2_API_URL"]
-    except (KeyError, FileNotFoundError):
-        return os.environ.get("AI_CHAT_V2_API_URL", "http://localhost:8080")
-
-
-DEFAULT_API_URL = read_default_api_url()
+API_URL = "https://us-central1-looppanel.cloudfunctions.net/ai-chat-v2"
 
 AGENT_LABELS = {
     "tool_agent": "Tool-Calling Agent",
@@ -63,8 +50,6 @@ if "authed" not in st.session_state:
     st.session_state.messages = []  # [{"role", "content", "evidence": [...], "model": ...}]
     st.session_state.model_catalog = {}  # {provider: [{"id", "label"}, ...]} from list_models
     st.session_state.selected_model = None  # None = deployment default
-if "api_url" not in st.session_state:
-    st.session_state.api_url = DEFAULT_API_URL
 
 PROVIDER_LABELS = {"openai": "OpenAI", "google": "Gemini", "anthropic": "Claude"}
 
@@ -87,9 +72,9 @@ def post_action(action: str, **fields) -> tuple[bool, dict]:
         **fields,
     }
     try:
-        response = requests.post(st.session_state.api_url, json=payload, timeout=30)
+        response = requests.post(API_URL, json=payload, timeout=30)
     except requests.RequestException as exc:
-        return False, {"error": f"Could not reach the API at {st.session_state.api_url}: {exc}"}
+        return False, {"error": f"Could not reach the API at {API_URL}: {exc}"}
 
     try:
         data = response.json()
@@ -102,9 +87,6 @@ def post_action(action: str, **fields) -> tuple[bool, dict]:
 def render_sign_in_form() -> None:
     st.title("AI Chat v2")
     st.caption("Sign in with your email, workspace, and the project you want to chat about.")
-
-    with st.expander("API connection", expanded=False):
-        st.session_state.api_url = st.text_input("API URL", value=st.session_state.api_url)
 
     with st.form("sign_in"):
         email = st.text_input("Email", placeholder="you@yourcompany.com")
@@ -278,7 +260,7 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
         payload["model"] = st.session_state.selected_model
 
     try:
-        response = requests.post(st.session_state.api_url, json=payload, stream=True, timeout=180)
+        response = requests.post(API_URL, json=payload, stream=True, timeout=180)
     except requests.RequestException as exc:
         status_box.update(label="Connection error", state="error")
         st.error(f"Could not reach the API: {exc}")
@@ -321,6 +303,8 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
                 outcome = "ok" if event.get("success") else "failed" if event.get("success") is False else "done"
                 duration = event.get("duration_ms") or 0
                 status_box.caption(f"{tool_name} {outcome} ({duration:.0f}ms)")
+                if event.get("error"):
+                    status_box.caption(f"  {event['error']}")
             elif event_type == "agent_call_completed":
                 agent = event.get("agent")
                 duration = event.get("duration_ms") or 0
