@@ -19,9 +19,14 @@ tool calls each one makes with their actual arguments AND response (not a
 generic "agent is running" placeholder - see app/orchestrator/runtime.py's
 event shapes), then the final answer with its evidence (transcript / AI note
 / insight) rendered underneath, matching the shared Evidence schema in
-app/schemas/evidence.py. The sidebar also tracks this workspace's per-model
-token usage (daily + per-thread session budgets - see
-app/services/usage_limits.py) as `usage` events arrive mid-stream.
+app/schemas/evidence.py.
+
+This workspace's per-model token usage (daily + weekly - see
+app/services/usage_limits.py; there's no per-thread budget) is shown on the
+project DASHBOARD (the thread list), fetched directly from the workspace's
+own stored counters - not something that only appears once a conversation
+has been started. It's also kept fresh from `usage` events while a turn is
+streaming, so it's current again the moment you go back to the dashboard.
 
 Run with: streamlit run streamlit_app.py
 Talks to the deployed ai_chat_v2 Cloud Function at API_URL below.
@@ -54,7 +59,7 @@ if "authed" not in st.session_state:
     st.session_state.messages = []  # [{"role", "content", "evidence": [...], "model": ...}]
     st.session_state.model_catalog = {}  # {provider: [{"id", "label"}, ...]} from list_models
     st.session_state.selected_model = None  # None = deployment default
-    st.session_state.usage_by_model = {}  # {model_id: {"daily": {...}, "session": {...}}} - from `usage` events
+    st.session_state.usage_by_model = {}  # {model_id: {"daily": {...}, "weekly": {...}}} - workspace-wide
 
 PROVIDER_LABELS = {"openai": "OpenAI", "google": "Gemini", "anthropic": "Claude"}
 
@@ -118,6 +123,7 @@ def render_sign_in_form() -> None:
             models_ok, models_data = post_action("list_models")
             if models_ok:
                 st.session_state.model_catalog = models_data.get("models", {})
+            refresh_usage()
             st.rerun()
         else:
             st.error(data.get("error") or "Could not sign in with those details.")
@@ -136,6 +142,18 @@ def refresh_threads() -> None:
     ok, data = post_action("list_threads", project_id=st.session_state.project_id)
     if ok:
         st.session_state.threads = data.get("threads", [])
+
+
+def refresh_usage() -> None:
+    """Pulls this workspace's real, current token usage per model directly
+    from the backend (the get_usage action - same numbers
+    app/tools/workspace.py's get_workspace_limits computes) - this is what
+    lets the dashboard show live usage before any conversation has been
+    opened or any message sent, instead of waiting on a `usage` SSE event
+    that only ever arrives mid-turn."""
+    ok, data = post_action("get_usage", project_id=st.session_state.project_id)
+    if ok:
+        st.session_state.usage_by_model = data.get("ai_chat_token_usage", {})
 
 
 def open_thread(thread_id: str) -> None:
@@ -162,6 +180,10 @@ def start_new_conversation() -> None:
 def render_thread_list() -> None:
     st.title("AI Chat v2")
     st.caption(f"Project `{st.session_state.project_id}` - threads are shared across the workspace.")
+
+    st.subheader("Token usage")
+    render_usage_breakdown()
+    st.divider()
 
     if st.button("Start new conversation", use_container_width=True, type="primary"):
         start_new_conversation()
@@ -206,11 +228,11 @@ def render_model_picker() -> None:
 
 
 def render_budget_bar(label: str, usage: dict, reset_hint: str) -> None:
-    """One tier's bar (daily/weekly/session) - a normal progress bar while
-    there's room left, but an unmissable red banner instead of a quiet 100%
-    bar once a tier is actually exhausted (app/services/usage_limits.py
-    blocks the NEXT message at that point - this should look like something
-    that just happened, not blend in with the other bars)."""
+    """One tier's bar (daily/weekly) - a normal progress bar while there's
+    room left, but an unmissable red banner instead of a quiet 100% bar once
+    a tier is actually exhausted (app/services/usage_limits.py blocks the
+    NEXT message at that point - this should look like something that just
+    happened, not blend in with the other bars)."""
     if not usage.get("limit"):
         return
     used, limit, remaining = usage["used"], usage["limit"], usage.get("remaining", 0)
@@ -221,23 +243,20 @@ def render_budget_bar(label: str, usage: dict, reset_hint: str) -> None:
 
 
 def render_usage_breakdown() -> None:
-    """This workspace's token usage, per model, as of the last `usage` event
-    seen (one arrives before every turn starts and again right after it
-    finishes - see app/orchestrator/runtime.py). Daily and weekly are shared
-    across the WHOLE WORKSPACE (every thread, every model-user); session is
-    just THIS thread's own budget for that model
-    (app/services/usage_limits.py) - kept as three separate bars since all
-    three reset on different triggers (midnight / next week / "start a new
-    conversation")."""
+    """This workspace's token usage, per model - daily and weekly, both
+    shared across the WHOLE WORKSPACE (every thread, every model-user;
+    there's no per-thread budget - see app/services/usage_limits.py).
+    Populated from a direct get_usage call (refresh_usage), kept current by
+    `usage` SSE events while a turn is streaming - either way this reads
+    real, stored counters, never an estimate."""
     if not st.session_state.usage_by_model:
-        st.caption("No usage recorded yet this session - send a message to see it.")
+        st.caption("No AI Chat usage recorded yet for this project.")
         return
 
     for model_id, usage in st.session_state.usage_by_model.items():
         st.markdown(f"**{model_display_label(model_id)}**")
         render_budget_bar("Daily", usage.get("daily") or {}, "Resets at midnight UTC.")
         render_budget_bar("Weekly", usage.get("weekly") or {}, "Resets at the start of next week.")
-        render_budget_bar("This thread", usage.get("session") or {}, "Start a new conversation to continue.")
 
 
 def render_sidebar() -> None:
@@ -248,13 +267,11 @@ def render_sidebar() -> None:
         st.divider()
         render_model_picker()
         st.divider()
-        st.markdown("**Token usage**")
-        render_usage_breakdown()
-        st.divider()
         if st.button("Back to threads", use_container_width=True):
             st.session_state.current_thread_id = None
             st.session_state.messages = []
             refresh_threads()
+            refresh_usage()
             st.rerun()
         if st.button("Sign out", use_container_width=True):
             sign_out()
@@ -361,7 +378,6 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
                 st.session_state.usage_by_model[event["model"]] = {
                     "daily": event.get("daily"),
                     "weekly": event.get("weekly"),
-                    "session": event.get("session"),
                 }
             elif event_type == "agent_call_started":
                 agent = event.get("agent")
@@ -471,9 +487,9 @@ def render_chat() -> None:
                 {"role": "assistant", "content": final_text, "evidence": evidence, "model": answer_model}
             )
 
-    # Refreshes the sidebar's usage breakdown with what this turn just spent -
-    # it was rendered before this turn ran, so without a rerun it would keep
-    # showing last turn's numbers until the next unrelated interaction.
+    # Keeps st.session_state.usage_by_model current with what this turn just
+    # spent, so the dashboard's usage breakdown is accurate the moment you go
+    # back to it, instead of showing stale numbers from before this turn.
     st.rerun()
 
 
