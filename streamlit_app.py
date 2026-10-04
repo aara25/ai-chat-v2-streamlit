@@ -205,31 +205,39 @@ def render_model_picker() -> None:
     )
 
 
+def render_budget_bar(label: str, usage: dict, reset_hint: str) -> None:
+    """One tier's bar (daily/weekly/session) - a normal progress bar while
+    there's room left, but an unmissable red banner instead of a quiet 100%
+    bar once a tier is actually exhausted (app/services/usage_limits.py
+    blocks the NEXT message at that point - this should look like something
+    that just happened, not blend in with the other bars)."""
+    if not usage.get("limit"):
+        return
+    used, limit, remaining = usage["used"], usage["limit"], usage.get("remaining", 0)
+    if remaining <= 0:
+        st.error(f"🚫 {label} limit reached - {used:,} / {limit:,} tokens used. {reset_hint}")
+    else:
+        st.progress(min(used / limit, 1.0), text=f"{label}: {used:,} / {limit:,} tokens ({remaining:,} left)")
+
+
 def render_usage_breakdown() -> None:
     """This workspace's token usage, per model, as of the last `usage` event
     seen (one arrives before every turn starts and again right after it
-    finishes - see app/orchestrator/runtime.py). Daily is shared across the
-    WHOLE WORKSPACE (every thread, every model-user); session is just THIS
-    thread's own budget for that model (app/services/usage_limits.py) - kept
-    as two separate bars since they reset on different triggers (midnight vs.
-    "start a new conversation")."""
+    finishes - see app/orchestrator/runtime.py). Daily and weekly are shared
+    across the WHOLE WORKSPACE (every thread, every model-user); session is
+    just THIS thread's own budget for that model
+    (app/services/usage_limits.py) - kept as three separate bars since all
+    three reset on different triggers (midnight / next week / "start a new
+    conversation")."""
     if not st.session_state.usage_by_model:
         st.caption("No usage recorded yet this session - send a message to see it.")
         return
 
     for model_id, usage in st.session_state.usage_by_model.items():
         st.markdown(f"**{model_display_label(model_id)}**")
-        daily, session = usage.get("daily") or {}, usage.get("session") or {}
-        if daily.get("limit"):
-            st.progress(
-                min(daily["used"] / daily["limit"], 1.0),
-                text=f"Daily: {daily['used']:,} / {daily['limit']:,} tokens ({daily.get('remaining', 0):,} left today)",
-            )
-        if session.get("limit"):
-            st.progress(
-                min(session["used"] / session["limit"], 1.0),
-                text=f"This thread: {session['used']:,} / {session['limit']:,} tokens ({session.get('remaining', 0):,} left)",
-            )
+        render_budget_bar("Daily", usage.get("daily") or {}, "Resets at midnight UTC.")
+        render_budget_bar("Weekly", usage.get("weekly") or {}, "Resets at the start of next week.")
+        render_budget_bar("This thread", usage.get("session") or {}, "Start a new conversation to continue.")
 
 
 def render_sidebar() -> None:
@@ -254,20 +262,30 @@ def render_sidebar() -> None:
 
 
 def render_evidence(evidence: list[dict]) -> None:
+    """Quote-backed items (transcript/ai_note/insight) come first in the
+    list, in the same order the answer's own [n] markers reference them
+    (see app/orchestrator/citations.py) - numbering them here in that same
+    order makes "[1]" in the answer and the first numbered item here always
+    the same thing. A generic tool_result entry has nothing citable in it,
+    so it's shown after the numbered ones with no number of its own."""
     if not evidence:
         return
     with st.expander(f"Evidence ({len(evidence)})"):
+        citation_number = 0
         for item in evidence:
             source_type = item.get("source_type")
+            if source_type in ("transcript", "ai_note", "insight"):
+                citation_number += 1
+            label = f"**[{citation_number}]** " if source_type in ("transcript", "ai_note", "insight") else ""
             if source_type == "transcript":
                 where = item.get("file_name") or item.get("source_id")
                 span = f" ({item.get('start_timestamp')}-{item.get('end_timestamp')})" if item.get("start_timestamp") else ""
                 speaker = f" - **{item['speaker']}**" if item.get("speaker") else ""
-                st.markdown(f"Transcript - **{where}**{span}{speaker}\n\n> {item.get('quote')}")
+                st.markdown(f"{label}Transcript - **{where}**{span}{speaker}\n\n> {item.get('quote')}")
             elif source_type == "ai_note":
-                st.markdown(f"Note `{item.get('note_id')}`\n\n> {item.get('quote')}")
+                st.markdown(f"{label}Note `{item.get('note_id')}`\n\n> {item.get('quote')}")
             elif source_type == "insight":
-                st.markdown(f"Insight `{item.get('insight_id')}`\n\n> {item.get('quote')}")
+                st.markdown(f"{label}Insight `{item.get('insight_id')}`\n\n> {item.get('quote')}")
             elif source_type == "tool_result":
                 st.markdown(f"Tool response - **{item.get('tool_name')}**({format_tool_params(item.get('tool_params'))})")
                 st.json(item.get("tool_response"), expanded=False)
@@ -340,7 +358,11 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
             if event_type == "run_started":
                 status_box.update(label="Working...")
             elif event_type == "usage":
-                st.session_state.usage_by_model[event["model"]] = {"daily": event.get("daily"), "session": event.get("session")}
+                st.session_state.usage_by_model[event["model"]] = {
+                    "daily": event.get("daily"),
+                    "weekly": event.get("weekly"),
+                    "session": event.get("session"),
+                }
             elif event_type == "agent_call_started":
                 agent = event.get("agent")
                 status_box.write(f"**{AGENT_LABELS.get(agent, agent)}** asked: {event.get('question')}")
