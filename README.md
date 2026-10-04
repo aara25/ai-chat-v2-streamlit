@@ -1,6 +1,6 @@
 # AI Chat v2 - Streamlit UI
 
-A front end for the `ai_chat_v2` Cloud Function (lives in the looppanel-backend repo). It signs in with email, workspace ID and project ID, lists the project's shared threads, and streams each answer live: which agent the supervisor called, the tools it ran, the final answer and its evidence.
+A front end for the `ai_chat_v2` Cloud Function (lives in the looppanel-backend repo). It signs in with email, workspace ID and project ID, lists the project's shared threads, and streams each answer live: which agent the supervisor called, that agent's own reasoning as it happens, the tools it ran (with their actual arguments and response, not just a status), the final answer and its evidence, and this workspace's token usage per model (daily and per-thread budgets) in the sidebar.
 
 ## Run locally
 

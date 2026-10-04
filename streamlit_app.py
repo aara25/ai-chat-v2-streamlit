@@ -13,12 +13,15 @@ After sign-in: the thread list for that project is shown (shared across the
 workspace - see the design doc - so a teammate's threads on this project
 show up here too), with a "Start new conversation" action alongside them.
 Once a thread is open, sending a message streams the orchestrator's steps
-live - which agent(s) the supervisor called and what it asked them, and the
-REAL, dynamic tool calls each one makes (actual tool name and arguments, not a generic "agent is running"
-placeholder - see app/orchestrator/runtime.py's tool_call_started/completed
-events) - then the final answer, with its evidence (transcript / AI note /
-insight) rendered underneath, matching the shared Evidence schema in
-app/schemas/evidence.py.
+live - which agent(s) the supervisor called and what it asked them, each
+one's real reasoning text as it happens (agent_thinking), the REAL, dynamic
+tool calls each one makes with their actual arguments AND response (not a
+generic "agent is running" placeholder - see app/orchestrator/runtime.py's
+event shapes), then the final answer with its evidence (transcript / AI note
+/ insight) rendered underneath, matching the shared Evidence schema in
+app/schemas/evidence.py. The sidebar also tracks this workspace's per-model
+token usage (daily + per-thread session budgets - see
+app/services/usage_limits.py) as `usage` events arrive mid-stream.
 
 Run with: streamlit run streamlit_app.py
 Talks to the deployed ai_chat_v2 Cloud Function at API_URL below.
@@ -36,6 +39,7 @@ API_URL = "https://us-central1-looppanel.cloudfunctions.net/ai-chat-v2"
 AGENT_LABELS = {
     "tool_agent": "Tool-Calling Agent",
     "rag_agent": "RAG Agent",
+    None: "Supervisor",
 }
 
 st.set_page_config(page_title="AI Chat v2")
@@ -50,6 +54,7 @@ if "authed" not in st.session_state:
     st.session_state.messages = []  # [{"role", "content", "evidence": [...], "model": ...}]
     st.session_state.model_catalog = {}  # {provider: [{"id", "label"}, ...]} from list_models
     st.session_state.selected_model = None  # None = deployment default
+    st.session_state.usage_by_model = {}  # {model_id: {"daily": {...}, "session": {...}}} - from `usage` events
 
 PROVIDER_LABELS = {"openai": "OpenAI", "google": "Gemini", "anthropic": "Claude"}
 
@@ -122,7 +127,7 @@ def sign_out() -> None:
     for key in (
         "authed", "user_email", "workspace_id", "project_id",
         "threads", "current_thread_id", "messages",
-        "model_catalog", "selected_model",
+        "model_catalog", "selected_model", "usage_by_model",
     ):
         st.session_state.pop(key, None)
 
@@ -200,6 +205,33 @@ def render_model_picker() -> None:
     )
 
 
+def render_usage_breakdown() -> None:
+    """This workspace's token usage, per model, as of the last `usage` event
+    seen (one arrives before every turn starts and again right after it
+    finishes - see app/orchestrator/runtime.py). Daily is shared across the
+    WHOLE WORKSPACE (every thread, every model-user); session is just THIS
+    thread's own budget for that model (app/services/usage_limits.py) - kept
+    as two separate bars since they reset on different triggers (midnight vs.
+    "start a new conversation")."""
+    if not st.session_state.usage_by_model:
+        st.caption("No usage recorded yet this session - send a message to see it.")
+        return
+
+    for model_id, usage in st.session_state.usage_by_model.items():
+        st.markdown(f"**{model_display_label(model_id)}**")
+        daily, session = usage.get("daily") or {}, usage.get("session") or {}
+        if daily.get("limit"):
+            st.progress(
+                min(daily["used"] / daily["limit"], 1.0),
+                text=f"Daily: {daily['used']:,} / {daily['limit']:,} tokens ({daily.get('remaining', 0):,} left today)",
+            )
+        if session.get("limit"):
+            st.progress(
+                min(session["used"] / session["limit"], 1.0),
+                text=f"This thread: {session['used']:,} / {session['limit']:,} tokens ({session.get('remaining', 0):,} left)",
+            )
+
+
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown(f"**Signed in as**\n\n{st.session_state.user_email}")
@@ -207,6 +239,9 @@ def render_sidebar() -> None:
         st.markdown(f"**Project**\n\n`{st.session_state.project_id}`")
         st.divider()
         render_model_picker()
+        st.divider()
+        st.markdown("**Token usage**")
+        render_usage_breakdown()
         st.divider()
         if st.button("Back to threads", use_container_width=True):
             st.session_state.current_thread_id = None
@@ -227,7 +262,8 @@ def render_evidence(evidence: list[dict]) -> None:
             if source_type == "transcript":
                 where = item.get("file_name") or item.get("source_id")
                 span = f" ({item.get('start_timestamp')}-{item.get('end_timestamp')})" if item.get("start_timestamp") else ""
-                st.markdown(f"Transcript - **{where}**{span}\n\n> {item.get('quote')}")
+                speaker = f" - **{item['speaker']}**" if item.get("speaker") else ""
+                st.markdown(f"Transcript - **{where}**{span}{speaker}\n\n> {item.get('quote')}")
             elif source_type == "ai_note":
                 st.markdown(f"Note `{item.get('note_id')}`\n\n> {item.get('quote')}")
             elif source_type == "insight":
@@ -245,9 +281,12 @@ def format_tool_params(params: dict) -> str:
 
 def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, list[dict]]:
     """POSTs send_message and processes the SSE stream, writing each step
-    into `status_box` as it arrives - which agent(s) the supervisor called and
-    what it asked them, and the real, per-tool calls each one makes - matching
-    app/orchestrator/runtime.py's event shapes exactly. Returns
+    into `status_box` as it arrives - which agent(s) the supervisor called
+    and what it asked them, each one's real reasoning text as it happens
+    (agent_thinking), and the real, per-tool calls each one makes INCLUDING
+    their actual response content - matching app/orchestrator/runtime.py's
+    event shapes exactly. Also updates st.session_state.usage_by_model from
+    any `usage` events seen (app/services/usage_limits.py). Returns
     (final_answer, evidence), (None, []) on failure."""
     payload = {
         "action": "send_message",
@@ -264,6 +303,15 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
     except requests.RequestException as exc:
         status_box.update(label="Connection error", state="error")
         st.error(f"Could not reach the API: {exc}")
+        return None, []
+
+    if response.status_code == 429:
+        status_box.update(label="Usage limit reached", state="error")
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        st.error(data.get("error") or "This workspace has hit its token usage limit.")
         return None, []
 
     if response.status_code != 200:
@@ -286,13 +334,21 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
 
             if event_type == "run_started":
                 status_box.update(label="Working...")
+            elif event_type == "usage":
+                st.session_state.usage_by_model[event["model"]] = {"daily": event.get("daily"), "session": event.get("session")}
             elif event_type == "agent_call_started":
                 agent = event.get("agent")
-                status_box.write(f"{AGENT_LABELS.get(agent, agent)} asked: {event.get('question')}")
+                status_box.write(f"**{AGENT_LABELS.get(agent, agent)}** asked: {event.get('question')}")
+            elif event_type == "agent_thinking":
+                # The model's own reasoning, attached to the same message it
+                # requested a tool call with - shown distinctly from both the
+                # agent-call banner above and the tool-call lines below, so a
+                # reader can follow WHY a tool was called, not just which one.
+                status_box.markdown(f"> 💭 _{event.get('text')}_")
             elif event_type == "tool_call_started":
                 tool_name = event.get("tool")
                 params = format_tool_params(event.get("params"))
-                status_box.caption(f"Calling {tool_name}({params})")
+                status_box.caption(f"🔧 Calling `{tool_name}({params})`")
             elif event_type == "tool_progress":
                 # Live per-transcript status from a correctness-first scan (see
                 # app/tools/analytics.py) - this is what keeps a slow-but-correct
@@ -300,15 +356,18 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
                 status_box.caption(event.get("detail"))
             elif event_type == "tool_call_completed":
                 tool_name = event.get("tool")
-                outcome = "ok" if event.get("success") else "failed" if event.get("success") is False else "done"
+                outcome = "✅" if event.get("success") else "❌" if event.get("success") is False else "•"
                 duration = event.get("duration_ms") or 0
-                status_box.caption(f"{tool_name} {outcome} ({duration:.0f}ms)")
+                status_box.caption(f"{outcome} `{tool_name}` finished ({duration:.0f}ms)")
                 if event.get("error"):
-                    status_box.caption(f"  {event['error']}")
+                    status_box.caption(f"&nbsp;&nbsp;&nbsp;⚠️ {event['error']}")
+                if event.get("response") is not None:
+                    with status_box.expander(f"{tool_name} response", expanded=False):
+                        st.json(event["response"])
             elif event_type == "agent_call_completed":
                 agent = event.get("agent")
                 duration = event.get("duration_ms") or 0
-                status_box.write(f"{AGENT_LABELS.get(agent, agent)} finished ({duration:.0f}ms)")
+                status_box.write(f"**{AGENT_LABELS.get(agent, agent)}** finished ({duration:.0f}ms)")
             elif event_type == "run_completed":
                 final_text = event.get("response")
                 evidence = event.get("evidence", [])
@@ -384,6 +443,11 @@ def render_chat() -> None:
             st.session_state.messages.append(
                 {"role": "assistant", "content": final_text, "evidence": evidence, "model": answer_model}
             )
+
+    # Refreshes the sidebar's usage breakdown with what this turn just spent -
+    # it was rendered before this turn ran, so without a rerun it would keep
+    # showing last turn's numbers until the next unrelated interaction.
+    st.rerun()
 
 
 def stream_words_with_delay(text: str, delay: float = 0.02):
