@@ -299,7 +299,12 @@ def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, l
         payload["model"] = st.session_state.selected_model
 
     try:
-        response = requests.post(API_URL, json=payload, stream=True, timeout=180)
+        # Matches the backend's own ceiling (cloudbuild.yaml's function
+        # --timeout and app/config.py's request_timeout_seconds, both raised
+        # to 300s) - a shorter client timeout than the backend's own would
+        # mean the UI gives up and shows a connection error before the
+        # backend would ever actually finish a large project's turn.
+        response = requests.post(API_URL, json=payload, stream=True, timeout=300)
     except requests.RequestException as exc:
         status_box.update(label="Connection error", state="error")
         st.error(f"Could not reach the API: {exc}")
