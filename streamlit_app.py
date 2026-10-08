@@ -1,513 +1,405 @@
-"""
-Streamlit UI for ai_chat_v2.
+"""Test page for the new AI chat (ai_chat), laid out for the ten first-cut features:
 
-Sign-in takes user_email, workspace_id AND project_id (unlike agentic-api's
-UI, which only needs the first two) - see the design doc's "Conversation and
-thread model": every thread is pinned to one project for its lifetime, so
-the project has to be chosen before any thread can be listed or created.
-There's no separate GET credential check here (ai_chat_v2/main.py doesn't
-have one) - signing in just calls list_threads, which runs the same auth
-gate internally; a bad email/workspace surfaces as that call's error.
+  working now      greeting, recommended questions, organisation prompt, Fast research,
+                   workspace and project scope, Help agent
+  not built yet    Deep research, charts, metadata filtering, adding files and images
+                   (their controls are shown disabled where they will live; charts, tables
+                   and the other answer blocks already draw when the backend sends them)
 
-After sign-in: the thread list for that project is shown (shared across the
-workspace - see the design doc - so a teammate's threads on this project
-show up here too), with a "Start new conversation" action alongside them.
-Once a thread is open, sending a message streams the orchestrator's steps
-live - which agent(s) the supervisor called and what it asked them, each
-one's real reasoning text as it happens (agent_thinking), the REAL, dynamic
-tool calls each one makes with their actual arguments AND response (not a
-generic "agent is running" placeholder - see app/orchestrator/runtime.py's
-event shapes), then the final answer with its evidence (transcript / AI note
-/ insight) rendered underneath, matching the shared Evidence schema in
-app/schemas/evidence.py.
-
-This workspace's per-model token usage (daily + weekly - see
-app/services/usage_limits.py; there's no per-thread budget) is shown on the
-project DASHBOARD (the thread list), fetched directly from the workspace's
-own stored counters - not something that only appears once a conversation
-has been started. It's also kept fresh from `usage` events while a turn is
-streaming, so it's current again the moment you go back to the dashboard.
-
-Run with: streamlit run streamlit_app.py
-Talks to the deployed ai_chat_v2 Cloud Function at API_URL below.
+Run:   streamlit run streamlit_app.py
+Needs: pip install -r requirements.txt
+The backend is the `ai-chat-staging` function. Change it in the "API URL" field, or set AI_CHAT_API_URL
+(for a local backend: http://localhost:8080, i.e. `functions-framework --target=ai_chat --debug`).
 """
 from __future__ import annotations
 
+import base64
 import json
-import time
+import os
 
+import pandas as pd
 import requests
 import streamlit as st
 
-API_URL = "https://us-central1-looppanel.cloudfunctions.net/ai-chat-v2"
+DEFAULT_API_URL = "https://us-central1-looppanel.cloudfunctions.net/ai-chat-staging"
+ALL_PROJECTS = "All projects"
+WHOLE_PROJECT = "Whole project"
+NOT_BUILT = "Not built yet"
+NOTICE_STYLE = {"error": st.error, "notfound": st.warning, "partial": st.warning, "widened": st.info}
 
-AGENT_LABELS = {
-    "tool_agent": "Tool-Calling Agent",
-    "rag_agent": "RAG Agent",
-    None: "Supervisor",
-}
-
-st.set_page_config(page_title="AI Chat v2")
-
-if "authed" not in st.session_state:
-    st.session_state.authed = False
-    st.session_state.user_email = ""
-    st.session_state.workspace_id = ""
-    st.session_state.project_id = ""
-    st.session_state.threads = []  # from list_threads
-    st.session_state.current_thread_id = None
-    st.session_state.messages = []  # [{"role", "content", "evidence": [...], "model": ...}]
-    st.session_state.model_catalog = {}  # {provider: [{"id", "label"}, ...]} from list_models
-    st.session_state.selected_model = None  # None = deployment default
-    st.session_state.usage_by_model = {}  # {model_id: {"daily": {...}, "weekly": {...}}} - workspace-wide
-
-PROVIDER_LABELS = {"openai": "OpenAI", "google": "Gemini", "anthropic": "Claude"}
+st.set_page_config(page_title="Looppanel AI chat", page_icon="💬", layout="wide")
+state = st.session_state
+for key, default in {"signed_in": False, "projects": [], "chat_id": None, "messages": [], "pending": None, "starters": {}, "files": {}}.items():
+    state.setdefault(key, default)
 
 
-def model_display_label(model_id: str) -> str:
-    """"OpenAI - GPT-5.1" - Streamlit's selectbox has no native grouping, so
-    the provider is folded into the label text instead of a separate optgroup."""
-    for provider, models in st.session_state.model_catalog.items():
-        for model in models:
-            if model["id"] == model_id:
-                return f"{PROVIDER_LABELS.get(provider, provider)} - {model['label']}"
-    return model_id
+# Talking to the backend
 
-
-def post_action(action: str, **fields) -> tuple[bool, dict]:
-    payload = {
-        "action": action,
-        "user_email": st.session_state.user_email,
-        "workspace_id": st.session_state.workspace_id,
-        **fields,
-    }
+def call(action: str, **fields):
+    """One JSON action. Returns the body, or None after showing the error."""
+    body = {"action": action, "user_id": state.user_id, "workspace_id": state.workspace_id, **fields}
     try:
-        response = requests.post(API_URL, json=payload, timeout=30)
-    except requests.RequestException as exc:
-        return False, {"error": f"Could not reach the API at {API_URL}: {exc}"}
-
-    try:
+        response = requests.post(state.api_url, json=body, timeout=300)
         data = response.json()
-    except ValueError:
-        return False, {"error": f"Unexpected response (HTTP {response.status_code})"}
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"{action} failed: {exc}")
+        return None
+    if not data.get("success"):
+        st.error(f"{action}: {data.get('error', response.status_code)}")
+        return None
+    return data
 
-    return (response.status_code == 200 and data.get("success", False)), data
 
-
-def render_sign_in_form() -> None:
-    st.title("AI Chat v2")
-    st.caption("Sign in with your email, workspace, and the project you want to chat about.")
-
-    with st.form("sign_in"):
-        email = st.text_input("Email", placeholder="you@yourcompany.com")
-        workspace_id = st.text_input("Workspace ID")
-        project_id = st.text_input("Project ID")
-        submitted = st.form_submit_button("Continue", use_container_width=True)
-
-    if submitted:
-        email, workspace_id, project_id = email.strip(), workspace_id.strip(), project_id.strip()
-        if not (email and workspace_id and project_id):
-            st.error("Email, workspace ID, and project ID are all required.")
+def stream_events(chat_id: str, content: str, scope: list):
+    body = {"action": "send_message", "user_id": state.user_id, "workspace_id": state.workspace_id,
+            "chat_id": chat_id, "content": content, "mode": "fast", "scope": scope}
+    with requests.post(state.api_url, json=body, stream=True, timeout=600) as response:
+        if "text/event-stream" not in response.headers.get("Content-Type", ""):
+            yield {"type": "notice", "kind": "error", "text": f"Request failed: {response.text[:300]}"}
             return
-
-        st.session_state.user_email = email
-        st.session_state.workspace_id = workspace_id
-        st.session_state.project_id = project_id
-
-        with st.spinner("Checking your account and loading threads..."):
-            ok, data = post_action("list_threads", project_id=project_id)
-
-        if ok:
-            st.session_state.authed = True
-            st.session_state.threads = data.get("threads", [])
-            models_ok, models_data = post_action("list_models")
-            if models_ok:
-                st.session_state.model_catalog = models_data.get("models", {})
-            refresh_usage()
-            st.rerun()
-        else:
-            st.error(data.get("error") or "Could not sign in with those details.")
+        for line in response.iter_lines(decode_unicode=True):
+            if line and line.startswith("data: "):
+                yield json.loads(line[6:])
 
 
-def sign_out() -> None:
-    for key in (
-        "authed", "user_email", "workspace_id", "project_id",
-        "threads", "current_thread_id", "messages",
-        "model_catalog", "selected_model", "usage_by_model",
-    ):
-        st.session_state.pop(key, None)
+# Scope: what the user has selected
+
+def project_files(project_id: str) -> list:
+    if project_id not in state.files:
+        data = call("list_files", project_id=project_id)
+        state.files[project_id] = data["files"] if data else []
+    return state.files[project_id]
 
 
-def refresh_threads() -> None:
-    ok, data = post_action("list_threads", project_id=st.session_state.project_id)
-    if ok:
-        st.session_state.threads = data.get("threads", [])
+def current_scope(project, file) -> list:
+    if file:
+        return [{"type": "file", "id": file["id"], "name": file["name"], "project_id": project["id"]}]
+    if project:
+        return [{"type": "project", "id": project["id"], "name": project["name"]}]
+    return []
 
 
-def refresh_usage() -> None:
-    """Pulls this workspace's real, current token usage per model directly
-    from the backend (the get_usage action - same numbers
-    app/tools/workspace.py's get_workspace_limits computes) - this is what
-    lets the dashboard show live usage before any conversation has been
-    opened or any message sent, instead of waiting on a `usage` SSE event
-    that only ever arrives mid-turn."""
-    ok, data = post_action("get_usage", project_id=st.session_state.project_id)
-    if ok:
-        st.session_state.usage_by_model = data.get("ai_chat_token_usage", {})
+def entry_point(scope: list) -> str:
+    return {"file": "file", "project": "project"}.get(scope[0]["type"], "global") if scope else "global"
 
 
-def open_thread(thread_id: str) -> None:
-    ok, data = post_action("get_thread", thread_id=thread_id)
-    if ok:
-        st.session_state.current_thread_id = thread_id
-        st.session_state.messages = data.get("messages", [])
-        st.rerun()
+def scope_label(scope: list) -> str:
+    return scope[0]["name"] if scope else ALL_PROJECTS
+
+
+def metadata_values(files: list) -> dict:
+    """For each metadata field on the project's files, how many files carry each value."""
+    fields: dict = {}
+    for file in files:
+        for item in file.get("metadata") or []:
+            if item.get("name") and item.get("value") not in (None, ""):
+                counts = fields.setdefault(item["name"], {})
+                counts[str(item["value"])] = counts.get(str(item["value"]), 0) + 1
+    return fields
+
+
+# Drawing an answer
+
+def segments_text(segments: list) -> str:
+    return "".join(s["text"] + "".join(f" `[{n}]`" for n in s.get("cite", [])) for s in segments)
+
+
+def clock(seconds) -> str:
+    if seconds is None:
+        return ""
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def chart_frame(spec: dict, by_segment: bool) -> pd.DataFrame:
+    rows = spec.get("rows") or []
+    segment = spec.get("segment")
+    if by_segment and segment:
+        data = {group["label"]: [row.get("by_group", {}).get(group["id"], 0) for row in rows] for group in segment["groups"]}
     else:
-        st.error(data.get("error") or "Could not open that thread.")
+        data = {spec.get("measure", "participants"): [row["total"] for row in rows]}
+    return pd.DataFrame(data, index=[row["label"] for row in rows])
 
 
-def start_new_conversation() -> None:
-    ok, data = post_action("create_thread", project_id=st.session_state.project_id)
-    if ok:
-        st.session_state.current_thread_id = data["thread_id"]
-        st.session_state.messages = []
-        refresh_threads()
-        st.rerun()
-    else:
-        st.error(data.get("error") or "Could not start a new conversation.")
+def draw_chart(block: dict, key: str) -> None:
+    """A chart is drawn only from the numbers in its spec; the title and caption are the model's words."""
+    spec = block["spec"]
+    st.markdown(f"**{spec['title']}**")
+    if spec.get("caption"):
+        st.caption(spec["caption"])
+    by_segment = False
+    if spec.get("segment"):
+        view = st.radio("View", ["Bar", f"By {spec['segment']['field']}"], horizontal=True, key=f"{key}-view", label_visibility="collapsed")
+        by_segment = view != "Bar"
+    frame = chart_frame(spec, by_segment)
+    st.bar_chart(frame, horizontal=True)
+    notes = []
+    if spec.get("denominator"):
+        notes.append(f"out of {spec['denominator']}")
+    flags = spec.get("flags") or {}
+    if flags.get("small_groups"):
+        notes.append("small sample: " + ", ".join(flags["small_groups"]))
+    if flags.get("unread_files"):
+        notes.append(f"{flags['unread_files']} files not read")
+    if flags.get("estimate"):
+        notes.append("estimate")
+    if spec.get("segment") and spec["segment"].get("unknown"):
+        notes.append(f"{spec['segment']['unknown']} with no {spec['segment']['field']}")
+    if notes:
+        st.caption(" · ".join(notes))
+    with st.expander("View data"):
+        st.dataframe(frame, width="stretch")
 
 
-def render_thread_list() -> None:
-    st.title("AI Chat v2")
-    st.caption(f"Project `{st.session_state.project_id}` - threads are shared across the workspace.")
-
-    st.subheader("Token usage")
-    render_usage_breakdown()
-    st.divider()
-
-    if st.button("Start new conversation", use_container_width=True, type="primary"):
-        start_new_conversation()
+def draw_sources(citations: list) -> None:
+    if not citations:
         return
-
-    st.divider()
-    if not st.session_state.threads:
-        st.info("No threads yet on this project. Start one above.")
-        return
-
-    for thread in st.session_state.threads:
-        title = thread.get("title") or "(untitled)"
-        created_by = thread.get("created_by", "unknown")
-        with st.container(border=True):
-            col1, col2 = st.columns([4, 1])
-            col1.markdown(f"**{title}**\n\nstarted by `{created_by}`")
-            if col2.button("Open", key=f"open_{thread['id']}", use_container_width=True):
-                open_thread(thread["id"])
+    with st.expander(f"Sources ({len(citations)})"):
+        for c in citations:
+            where = c.get("title") or c.get("file_name") or c.get("file_id") or ""
+            label = c["type"].replace("_", " ") + (" · AI analysis" if c.get("derived") else "")
+            st.markdown(f"**[{c['n']}]** {label} · {where} {clock(c.get('start'))}")
+            if c.get("quote"):
+                st.caption(c["quote"])
+            if c.get("url"):
+                st.markdown(c["url"])
 
 
-def render_model_picker() -> None:
-    """Flattens the provider-grouped catalog into one selectbox - the chosen
-    model id is sent as SendMessageRequest.model and saved per-message (see
-    conversation_store.save_message), not just once per thread, since the
-    selection can change mid-thread."""
-    all_model_ids = [m["id"] for models in st.session_state.model_catalog.values() for m in models]
-    if not all_model_ids:
-        return
-
-    if st.session_state.selected_model not in all_model_ids:
-        st.session_state.selected_model = None  # stale/unset selection - fall back to the deployment default
-
-    # No `index=` here on purpose: `key` already binds this widget to
-    # st.session_state.selected_model (initialized above), and Streamlit
-    # disallows setting both a key's session_state value and `index` at once.
-    st.selectbox(
-        "Model",
-        options=[None] + all_model_ids,
-        format_func=lambda model_id: "Deployment default" if model_id is None else model_display_label(model_id),
-        key="selected_model",
-    )
-
-
-def render_budget_bar(label: str, usage: dict, reset_hint: str) -> None:
-    """One tier's bar (daily/weekly) - a normal progress bar while there's
-    room left, but an unmissable red banner instead of a quiet 100% bar once
-    a tier is actually exhausted (app/services/usage_limits.py blocks the
-    NEXT message at that point - this should look like something that just
-    happened, not blend in with the other bars)."""
-    if not usage.get("limit"):
-        return
-    used, limit, remaining = usage["used"], usage["limit"], usage.get("remaining", 0)
-    if remaining <= 0:
-        st.error(f"🚫 {label} limit reached - {used:,} / {limit:,} tokens used. {reset_hint}")
-    else:
-        st.progress(min(used / limit, 1.0), text=f"{label}: {used:,} / {limit:,} tokens ({remaining:,} left)")
-
-
-def render_usage_breakdown() -> None:
-    """This workspace's token usage, per model - daily and weekly, both
-    shared across the WHOLE WORKSPACE (every thread, every model-user;
-    there's no per-thread budget - see app/services/usage_limits.py).
-    Populated from a direct get_usage call (refresh_usage), kept current by
-    `usage` SSE events while a turn is streaming - either way this reads
-    real, stored counters, never an estimate."""
-    if not st.session_state.usage_by_model:
-        st.caption("No AI Chat usage recorded yet for this project.")
-        return
-
-    for model_id, usage in st.session_state.usage_by_model.items():
-        st.markdown(f"**{model_display_label(model_id)}**")
-        render_budget_bar("Daily", usage.get("daily") or {}, "Resets at midnight UTC.")
-        render_budget_bar("Weekly", usage.get("weekly") or {}, "Resets at the start of next week.")
+def draw_blocks(blocks: list, citations: list, key: str, live: bool) -> None:
+    """`live` is True for the newest answer only, so only its follow-up chips can be clicked."""
+    by_number = {c["n"]: c for c in citations}
+    for index, block in enumerate(blocks):
+        kind = block["type"]
+        if kind == "direct":
+            st.markdown(segments_text(block["segments"]))
+        elif kind == "sections":
+            for section in block["sections"]:
+                st.markdown(f"**{section['title']}**")
+                for bullet in section["bullets"]:
+                    st.markdown("- " + segments_text(bullet["segments"]))
+        elif kind == "chart":
+            draw_chart(block, f"{key}-chart-{index}")
+        elif kind == "table":
+            st.markdown(f"**{block['title']}**")
+            st.dataframe(pd.DataFrame([row["cells"] for row in block["rows"]], columns=block["columns"]), width="stretch", hide_index=True)
+        elif kind == "ai_card":
+            st.info(f"**{block['title']}** {block.get('count_label', '')}\n\n{block.get('summary', '')}")
+        elif kind == "snippets":
+            for snippet in block["snippets"]:
+                st.caption(f"[{snippet['citation_n']}] {snippet['file_name']}")
+                for line in snippet["lines"]:
+                    st.markdown(f"> **{line['speaker']}** {line['time']}  \n> {line['text']}")
+        elif kind == "clips":
+            st.markdown("**Clips**")
+            for n in block["citation_ns"]:
+                c = by_number.get(n, {})
+                st.caption(f"[{n}] {c.get('file_name') or c.get('file_id') or ''} {clock(c.get('start'))} · {c.get('quote', '')[:160]}")
+        elif kind == "did":
+            took = f" · {block['duration_seconds']}s" if block.get("duration_seconds") else ""
+            with st.expander(f"What I did · {block['summary']}{took}"):
+                for step in block["steps"]:
+                    st.markdown(f"- {step['label']}" + (f" ({step['count']})" if step.get("count") else ""))
+    draw_sources(citations)
+    for block in blocks:
+        if block["type"] == "followups" and live:
+            st.caption("Ask next")
+            for index, item in enumerate(block["items"]):
+                if st.button(item["question"], key=f"{key}-follow-{index}"):
+                    state.pending = item["question"]
+                    st.rerun()
 
 
-def render_sidebar() -> None:
-    with st.sidebar:
-        st.markdown(f"**Signed in as**\n\n{st.session_state.user_email}")
-        st.markdown(f"**Workspace**\n\n`{st.session_state.workspace_id}`")
-        st.markdown(f"**Project**\n\n`{st.session_state.project_id}`")
-        st.divider()
-        render_model_picker()
-        st.divider()
-        if st.button("Back to threads", use_container_width=True):
-            st.session_state.current_thread_id = None
-            st.session_state.messages = []
-            refresh_threads()
-            refresh_usage()
-            st.rerun()
-        if st.button("Sign out", use_container_width=True):
-            sign_out()
-            st.rerun()
+def draw_notice(notice: dict) -> None:
+    NOTICE_STYLE.get(notice["kind"], st.info)(notice["text"])
 
 
-def render_evidence(evidence: list[dict]) -> None:
-    """Quote-backed items (transcript/ai_note/insight) come first in the
-    list, in the same order the answer's own [n] markers reference them
-    (see app/orchestrator/citations.py) - numbering them here in that same
-    order makes "[1]" in the answer and the first numbered item here always
-    the same thing. A generic tool_result entry has nothing citable in it,
-    so it's shown after the numbered ones with no number of its own."""
-    if not evidence:
-        return
-    with st.expander(f"Evidence ({len(evidence)})"):
-        citation_number = 0
-        for item in evidence:
-            source_type = item.get("source_type")
-            if source_type in ("transcript", "ai_note", "insight"):
-                citation_number += 1
-            label = f"**[{citation_number}]** " if source_type in ("transcript", "ai_note", "insight") else ""
-            if source_type == "transcript":
-                where = item.get("file_name") or item.get("source_id")
-                span = f" ({item.get('start_timestamp')}-{item.get('end_timestamp')})" if item.get("start_timestamp") else ""
-                speaker = f" - **{item['speaker']}**" if item.get("speaker") else ""
-                st.markdown(f"{label}Transcript - **{where}**{span}{speaker}\n\n> {item.get('quote')}")
-            elif source_type == "ai_note":
-                st.markdown(f"{label}Note `{item.get('note_id')}`\n\n> {item.get('quote')}")
-            elif source_type == "insight":
-                st.markdown(f"{label}Insight `{item.get('insight_id')}`\n\n> {item.get('quote')}")
-            elif source_type == "tool_result":
-                st.markdown(f"Tool response - **{item.get('tool_name')}**({format_tool_params(item.get('tool_params'))})")
-                st.json(item.get("tool_response"), expanded=False)
-            else:
-                st.markdown(f"{item.get('quote')}")
-
-
-def format_tool_params(params: dict) -> str:
-    return ", ".join(f"{key}={value!r}" for key, value in (params or {}).items())
-
-
-def stream_orchestrator_response(prompt: str, status_box) -> tuple[str | None, list[dict]]:
-    """POSTs send_message and processes the SSE stream, writing each step
-    into `status_box` as it arrives - which agent(s) the supervisor called
-    and what it asked them, each one's real reasoning text as it happens
-    (agent_thinking), and the real, per-tool calls each one makes INCLUDING
-    their actual response content - matching app/orchestrator/runtime.py's
-    event shapes exactly. Also updates st.session_state.usage_by_model from
-    any `usage` events seen (app/services/usage_limits.py). Returns
-    (final_answer, evidence), (None, []) on failure."""
-    payload = {
-        "action": "send_message",
-        "user_email": st.session_state.user_email,
-        "workspace_id": st.session_state.workspace_id,
-        "thread_id": st.session_state.current_thread_id,
-        "content": prompt,
-    }
-    if st.session_state.selected_model:
-        payload["model"] = st.session_state.selected_model
-
-    try:
-        # Matches the backend's own ceiling (cloudbuild.yaml's function
-        # --timeout and app/config.py's request_timeout_seconds, both raised
-        # to 300s) - a shorter client timeout than the backend's own would
-        # mean the UI gives up and shows a connection error before the
-        # backend would ever actually finish a large project's turn.
-        response = requests.post(API_URL, json=payload, stream=True, timeout=300)
-    except requests.RequestException as exc:
-        status_box.update(label="Connection error", state="error")
-        st.error(f"Could not reach the API: {exc}")
-        return None, []
-
-    if response.status_code == 429:
-        status_box.update(label="Usage limit reached", state="error")
-        try:
-            data = response.json()
-        except ValueError:
-            data = {}
-        st.error(data.get("error") or "This workspace has hit its token usage limit.")
-        return None, []
-
-    if response.status_code != 200:
-        status_box.update(label="Request failed", state="error")
-        try:
-            error_message = response.json().get("error", f"HTTP {response.status_code}")
-        except ValueError:
-            error_message = f"HTTP {response.status_code}"
-        st.error(error_message)
-        return None, []
-
-    final_text, evidence, failed = None, [], False
-    try:
-        for raw_line in response.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data: "):
-                continue
-
-            event = json.loads(raw_line[len("data: "):])
-            event_type = event.get("type")
-
-            if event_type == "run_started":
-                status_box.update(label="Working...")
-            elif event_type == "usage":
-                st.session_state.usage_by_model[event["model"]] = {
-                    "daily": event.get("daily"),
-                    "weekly": event.get("weekly"),
-                }
-            elif event_type == "agent_call_started":
-                agent = event.get("agent")
-                status_box.write(f"**{AGENT_LABELS.get(agent, agent)}** asked: {event.get('question')}")
-            elif event_type == "agent_thinking":
-                # The model's own reasoning, attached to the same message it
-                # requested a tool call with - shown distinctly from both the
-                # agent-call banner above and the tool-call lines below, so a
-                # reader can follow WHY a tool was called, not just which one.
-                status_box.markdown(f"> 💭 _{event.get('text')}_")
-            elif event_type == "tool_call_started":
-                tool_name = event.get("tool")
-                params = format_tool_params(event.get("params"))
-                status_box.caption(f"🔧 Calling `{tool_name}({params})`")
-            elif event_type == "tool_progress":
-                # Live per-transcript status from a correctness-first scan (see
-                # app/tools/analytics.py) - this is what keeps a slow-but-correct
-                # answer feeling live instead of a silent multi-second wait.
-                status_box.caption(event.get("detail"))
-            elif event_type == "tool_call_completed":
-                tool_name = event.get("tool")
-                outcome = "✅" if event.get("success") else "❌" if event.get("success") is False else "•"
-                duration = event.get("duration_ms") or 0
-                status_box.caption(f"{outcome} `{tool_name}` finished ({duration:.0f}ms)")
-                if event.get("error"):
-                    status_box.caption(f"&nbsp;&nbsp;&nbsp;⚠️ {event['error']}")
-                if event.get("response") is not None:
-                    with status_box.expander(f"{tool_name} response", expanded=False):
-                        st.json(event["response"])
-            elif event_type == "agent_call_completed":
-                agent = event.get("agent")
-                duration = event.get("duration_ms") or 0
-                status_box.write(f"**{AGENT_LABELS.get(agent, agent)}** finished ({duration:.0f}ms)")
-            elif event_type == "run_completed":
-                final_text = event.get("response")
-                evidence = event.get("evidence", [])
-                status_box.update(label="Done", state="complete", expanded=False)
-            elif event_type == "error":
-                failed = True
-                status_box.update(label="Error", state="error")
-                st.error(event.get("error") or "Something went wrong")
-    except requests.RequestException as exc:
-        status_box.update(label="Connection lost", state="error")
-        st.error(f"The connection dropped before an answer arrived: {exc}")
-        return None, []
-
-    if final_text is None and not failed:
-        status_box.update(label="No answer", state="error")
-        st.error("The stream ended without an answer. Try asking again.")
-
-    return final_text, evidence
-
-
-def render_sender_label(message: dict) -> None:
-    """Threads are shared across the workspace (see the design doc's
-    "Conversation and thread model") - without showing who sent each
-    message, a thread with more than one participant reads as an
-    unattributed jumble. Only user messages need this; assistant messages
-    have no ambiguity about who "sent" them."""
-    if message.get("role") != "user":
-        return
-    sender = message.get("user_name") or message.get("user_email")
-    if sender and sender != st.session_state.user_email:
-        st.caption(sender)
-
-
-def render_model_caption(message: dict) -> None:
-    """Which model answered this message (or requested it, on a user
-    message) - saved per-message in Firestore (see
-    conversation_store.save_message), not just once per thread, since the
-    selection can change mid-thread."""
-    model_id = message.get("model")
-    if model_id:
-        st.caption(model_display_label(model_id))
-
-
-def render_chat() -> None:
-    st.title("AI Chat v2")
-
-    for message in st.session_state.messages:
-        with st.chat_message(message.get("role", "assistant")):
-            render_sender_label(message)
-            st.markdown(message.get("content", ""))
-            render_evidence(message.get("evidence") or [])
-            if message.get("role") == "assistant":
-                render_model_caption(message)
-
-    prompt = st.chat_input("Ask about this project's transcripts, notes, or insights...")
-    if not prompt:
-        return
-
-    st.session_state.messages.append({"role": "user", "content": prompt, "model": st.session_state.selected_model})
+def run_turn(question: str, scope: list) -> None:
+    """Creates the chat if needed, sends the question and draws the reply as it streams."""
+    if not state.chat_id:
+        created = call("create_chat", scope=scope, entry_point=entry_point(scope))
+        if not created:
+            return
+        state.chat_id = created["chat_id"]
+    state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
-        st.markdown(prompt)
-
+        st.markdown(question)
+    blocks, citations, notices = [], [], []
     with st.chat_message("assistant"):
-        with st.status("Thinking...", expanded=True) as status_box:
-            final_text, evidence = stream_orchestrator_response(prompt, status_box)
-
-        if final_text:
-            st.write_stream(stream_words_with_delay(final_text))
-            render_evidence(evidence)
-            answer_model = st.session_state.selected_model
-            if answer_model:
-                st.caption(model_display_label(answer_model))
-            st.session_state.messages.append(
-                {"role": "assistant", "content": final_text, "evidence": evidence, "model": answer_model}
-            )
-
-    # Keeps st.session_state.usage_by_model current with what this turn just
-    # spent, so the dashboard's usage breakdown is accurate the moment you go
-    # back to it, instead of showing stale numbers from before this turn.
-    st.rerun()
-
-
-def stream_words_with_delay(text: str, delay: float = 0.02):
-    """The backend delivers the final answer as one complete message, not
-    token-by-token - this reveals it word by word so it reads as live rather
-    than popping in all at once."""
-    words = text.split(" ")
-    for i, word in enumerate(words):
-        yield word + (" " if i < len(words) - 1 else "")
-        time.sleep(delay)
+        with st.status("Working…", expanded=True) as status:
+            for event in stream_events(state.chat_id, question, scope):
+                if event["type"] == "step":
+                    counts = ", ".join(f"{v} {k}" for k, v in event.get("counts", {}).items())
+                    st.write(("✗ " if event["status"] == "failed" else "✓ ") + event["label"] + (f" · {counts}" if counts else ""))
+                elif event["type"] == "block":
+                    blocks.append(event["block"])
+                elif event["type"] == "citations":
+                    citations = event["citations"]
+                elif event["type"] == "notice":
+                    notices.append(event)
+                elif event["type"] == "run_completed":
+                    status.update(label=f"Done ({event['status']})", state="complete" if event["status"] == "complete" else "error", expanded=False)
+        for notice in notices:
+            draw_notice(notice)
+        draw_blocks(blocks, citations, f"m{len(state.messages)}", live=True)
+    state.messages.append({"role": "assistant", "blocks": blocks, "citations": citations, "notices": notices})
 
 
-if not st.session_state.authed:
-    render_sign_in_form()
-elif not st.session_state.current_thread_id:
-    render_sidebar()
-    render_thread_list()
-else:
-    render_sidebar()
-    render_chat()
+def open_chat(chat_id: str) -> None:
+    data = call("get_chat", chat_id=chat_id)
+    if data:
+        state.chat_id = chat_id
+        state.messages = data["messages"]
+
+
+# Sidebar: sign in
+
+with st.sidebar:
+    st.title("Looppanel AI")
+    st.text_input("API URL", os.environ.get("AI_CHAT_API_URL", DEFAULT_API_URL), key="api_url")
+    st.text_input("User id", key="user_id")
+    st.text_input("Workspace id", key="workspace_id")
+    time_zone = st.text_input("Time zone (for the greeting)", getattr(getattr(st, "context", None), "timezone", None) or "Asia/Kolkata")
+    if st.button("Sign in", type="primary", width="stretch") and state.user_id and state.workspace_id:
+        listed = call("list_projects")
+        if listed is not None:
+            state.update(signed_in=True, projects=listed["projects"], chat_id=None, messages=[], starters={}, files={})
+
+if not state.signed_in:
+    st.info("Enter the API URL, a user id and that user's workspace id, then sign in.")
+    st.stop()
+
+
+# Sidebar: where to look, metadata filters, chats
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Where to look")
+    names = [ALL_PROJECTS] + [p["name"] for p in state.projects]
+    picked = st.radio("Project", names, label_visibility="collapsed")
+    project = next((p for p in state.projects if p["name"] == picked), None)
+    file = None
+    if project:
+        for s in project.get("stages", []):
+            st.caption(f"{s['label']}: {s['status']}" + (f" ({s['error']})" if s.get("error") else ""))
+        files = project_files(project["id"])
+        file_name = st.selectbox("File", [WHOLE_PROJECT] + [f["name"] for f in files])
+        file = next((f for f in files if f["name"] == file_name), None)
+    scope = current_scope(project, file)
+    st.caption("The selection is where the chat looks first. A question about something else is searched across every project you can open.")
+
+    if project:
+        fields = metadata_values(project_files(project["id"]))
+        st.subheader("Filter by metadata")
+        if not fields:
+            st.caption("The files in this project carry no metadata.")
+        for name, values in fields.items():
+            st.multiselect(name, [f"{value} ({count})" for value, count in values.items()], disabled=True, key=f"filter-{project['id']}-{name}")
+        st.caption(f"{NOT_BUILT}: filters are listed from this project's file metadata but do not narrow questions yet.")
+
+    st.divider()
+    if st.button("New chat", width="stretch"):
+        state.update(chat_id=None, messages=[])
+    listed_chats = call("list_chats") or {"chats": []}
+    for chat in listed_chats["chats"][:20]:
+        left, right = st.columns([5, 1])
+        if left.button(chat.get("title") or "Untitled", key=f"open-{chat['id']}", width="stretch"):
+            open_chat(chat["id"])
+        if right.button("✕", key=f"del-{chat['id']}"):
+            call("delete_chat", chat_id=chat["id"])
+            if state.chat_id == chat["id"]:
+                state.update(chat_id=None, messages=[])
+            st.rerun()
+    if state.chat_id:
+        new_title = st.text_input("Rename this chat", key=f"rename-{state.chat_id}")
+        if new_title and st.button("Save name"):
+            call("rename_chat", chat_id=state.chat_id, title=new_title)
+            st.rerun()
+
+
+chat_tab, settings_tab = st.tabs(["Chat", "Settings"])
+
+
+# Settings: organisation prompt and project summary
+
+with settings_tab:
+    st.subheader("Organisation prompt")
+    st.caption("Applies to every chat in this workspace and shapes the recommended questions. Only workspace editors can change it.")
+    saved = (call("get_org_context") or {}).get("org_context")
+    if saved:
+        st.caption(f"Saved from {saved.get('source')} · {saved.get('status')} · {saved.get('original_chars')} characters")
+    text = st.text_area("About your organisation", (saved or {}).get("used_text", ""), height=200, key="org-text")
+    pdf = st.file_uploader("Or upload a PDF", type=["pdf"], key="org-pdf")
+    if st.button("Save organisation prompt"):
+        fields_to_send = {"pdf_base64": base64.b64encode(pdf.getvalue()).decode(), "file_name": pdf.name} if pdf else {"text": text}
+        result = call("set_org_context", **fields_to_send)
+        if result:
+            state.starters = {}
+            st.success(result.get("message") or "Saved. Recommended questions will be rewritten.")
+
+    st.divider()
+    st.subheader("Project summary")
+    if not project:
+        st.caption("Pick a project in the sidebar to see its summary.")
+    else:
+        rebuild = st.button("Rebuild now")
+        data = call("get_project_summary", project_id=project["id"], rebuild=rebuild)
+        summary = (data or {}).get("summary")
+        if not summary:
+            st.caption("No summary yet. Rebuild to write one.")
+        else:
+            st.caption(f"{summary.get('files_summarised')} of {summary.get('files_total')} files · built {summary.get('built_at')}")
+            if summary.get("files_failed"):
+                st.warning("Could not summarise: " + ", ".join(summary["files_failed"]))
+            st.markdown(f"**In one paragraph**\n\n{summary.get('brief') or ''}")
+            st.markdown(summary.get("text") or "")
+            st.json(summary.get("facts") or {}, expanded=False)
+
+
+# Chat: greeting and recommended questions, or the open chat
+
+with chat_tab:
+    top_left, top_middle, top_right = st.columns([5, 2, 2])
+    top_left.caption(f"Looking in: **{scope_label(scope)}**")
+    top_middle.toggle("Deep research", value=False, disabled=True, help=f"{NOT_BUILT}. Fast research is the only mode today.")
+    with top_right.popover("Attach a file or image"):
+        st.file_uploader("File or image", type=["pdf", "png", "jpg", "jpeg"], disabled=True, key="attachment")
+        st.caption(f"{NOT_BUILT}.")
+
+    if not state.chat_id and not state.pending:
+        key = json.dumps(scope, sort_keys=True)
+        if key not in state.starters:
+            with st.spinner("Preparing suggestions…"):
+                data = call("get_starters", scope=scope, entry_point=entry_point(scope), time_zone=time_zone)
+            state.starters[key] = data["starters"] if data else None
+        starters = state.starters[key]
+        if starters:
+            st.header(starters.get("greeting") or "Hello")
+            if starters.get("opener"):
+                st.write(starters["opener"])
+            for index, item in enumerate(starters["items"]):
+                label = ("❓ " if item.get("kind") == "how_to" else "") + item["question"]
+                if st.button(label, key=f"starter-{index}"):
+                    state.pending = item["question"]
+                    st.rerun()
+                if item.get("article_url"):
+                    st.caption(f"Help article: {item['article_url']}")
+        if st.button("Refresh suggestions"):
+            state.starters.pop(key, None)
+            st.rerun()
+
+    for index, message in enumerate(state.messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "user":
+                st.markdown(message.get("content", ""))
+            else:
+                for notice in message.get("notices", []):
+                    draw_notice(notice)
+                last = index == len(state.messages) - 1 and not state.pending
+                draw_blocks(message.get("blocks", []), message.get("citations", []), f"m{index}", live=last)
+
+    typed = st.chat_input(f"Ask about {scope_label(scope)}")
+    question = state.pending or typed
+    if question:
+        state.pending = None
+        run_turn(question, scope)
+        st.rerun()
