@@ -269,8 +269,9 @@ def show_starters(scope: list) -> None:
                 if shown["starters"]["items"]:
                     draw_starters(holder, shown["starters"])
                 else:
+                    reason = f" ({written['failure']})" if written.get("failure") else ""
                     with holder.container():
-                        st.caption("Suggestions are unavailable right now. You can still ask a question below.")
+                        st.caption(f"Suggestions are unavailable right now{reason}. You can still ask a question below.")
             elif written:
                 state.starters[key] = {**shown, "more_coming": written["more_coming"]}
     else:
