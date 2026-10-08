@@ -269,7 +269,11 @@ def show_starters(scope: list) -> None:
     shown = state.starters.get(key)
     if shown:
         timings = shown.get("timings_ms") or {}
-        st.caption(f"Suggestions: {shown.get('source')} · {timings.get('total', '?')} ms")
+        pool = shown.get("pool")
+        detail = f" · {pool['size']} in the pool, {pool['unseen']} not shown yet" if pool else ""
+        st.caption(f"Suggestions: {shown.get('source')} · {timings.get('total', '?')} ms{detail}")
+        if "more_coming" not in shown:
+            st.warning("This backend is an older version without Refresh, so the same questions come back. Redeploy ai-chat-staging.")
         st.button("Refresh suggestions", on_click=request_refresh, args=(key,))
 
 
