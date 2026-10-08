@@ -14,6 +14,7 @@ The backend is the `ai-chat-staging` function. Change it in the "API URL" field,
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 
@@ -210,13 +211,13 @@ def draw_blocks(blocks: list, citations: list, key: str, live: bool) -> None:
 
 
 def draw_starters(holder, starters: dict, note: str = "") -> None:
-    """The greeting, the opener and the question buttons. Button ids are the same on every run, so a click is never lost."""
+    """The greeting, the opener and the question buttons. A button's id comes from its question, so it is the same on every run (a click is never lost) and differs between two sets drawn in one run."""
     with holder.container():
         st.header(starters.get("greeting") or "Hello")
         if starters.get("opener"):
             st.write(starters["opener"])
         for index, item in enumerate(starters["items"]):
-            if st.button(item["question"], key=f"starter-{index}"):
+            if st.button(item["question"], key=f"starter-{hashlib.sha1(item['question'].encode()).hexdigest()[:10]}"):
                 state.pending = item["question"]
                 st.rerun()
             if item.get("article_url"):
@@ -254,6 +255,14 @@ def show_starters(scope: list) -> None:
                 st.caption("Writing suggestions for you…")
         if shown.get("more_coming") or not items_on_screen:
             written = call("get_starters", generate=True, **ask)
+            if written and shown.get("exhausted"):
+                # Nothing new was left, so the questions on screen are the old ones. Now that more are written, show them.
+                again = call("get_starters", refresh=True, **ask)
+                if again and again["starters"]["items"] and not again.get("exhausted"):
+                    shown = again
+                    state.starters[key] = shown
+                    draw_starters(holder, shown["starters"])
+                    written = None
             if written and not items_on_screen:
                 shown = written
                 state.starters[key] = shown
