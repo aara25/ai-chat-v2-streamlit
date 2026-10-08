@@ -217,8 +217,7 @@ def draw_starters(holder, starters: dict, stage: str) -> None:
         if starters.get("opener"):
             st.write(starters["opener"])
         for index, item in enumerate(starters["items"]):
-            label = ("❓ " if item.get("kind") == "how_to" else "") + item["question"]
-            if st.button(label, key=f"starter-{stage}-{index}"):
+            if st.button(item["question"], key=f"starter-{stage}-{index}"):
                 state.pending = item["question"]
                 st.rerun()
             if item.get("article_url"):
