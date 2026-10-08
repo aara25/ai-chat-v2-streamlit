@@ -222,7 +222,36 @@ def draw_starters(holder, starters: dict, stage: str) -> None:
                 state.pending = item["question"]
                 st.rerun()
             if item.get("article_url"):
-                st.caption(f"Help article: {item['article_url']}")
+                st.caption(f"[Help article]({item['article_url']})")
+
+
+def show_starters(scope: list) -> None:
+    """The greeting and the suggested questions for the selection."""
+    key = json.dumps(scope, sort_keys=True)
+    holder = st.empty()
+    shown = state.starters.get(key)
+    if shown is None:
+        # The backend answers at once with what it has (saved, older or built-in). Draw that, then
+        # ask for the written set and swap it in when it arrives.
+        ask = {"scope": scope, "entry_point": entry_point(scope), "time_zone": state.time_zone}
+        shown = call("get_starters", **ask)
+        if shown:
+            draw_starters(holder, shown["starters"], "quick")
+            if not shown.get("fresh", True):
+                with st.spinner("Writing suggestions for you…"):
+                    written = call("get_starters", generate=True, **ask)
+                if written:
+                    shown = written
+                    draw_starters(holder, written["starters"], "final")
+        state.starters[key] = shown
+    else:
+        draw_starters(holder, shown["starters"], "final")
+    if shown:
+        timings = shown.get("timings_ms") or {}
+        st.caption(f"Suggestions: {shown.get('source')} · {timings.get('total', '?')} ms")
+    if st.button("Refresh suggestions"):
+        state.starters.pop(key, None)
+        st.rerun()
 
 
 def draw_notice(notice: dict) -> None:
@@ -274,7 +303,7 @@ with st.sidebar:
     st.text_input("API URL", os.environ.get("AI_CHAT_API_URL", DEFAULT_API_URL), key="api_url")
     st.text_input("User id", key="user_id")
     st.text_input("Workspace id", key="workspace_id")
-    time_zone = st.text_input("Time zone (for the greeting)", getattr(getattr(st, "context", None), "timezone", None) or "Asia/Kolkata")
+    st.text_input("Time zone (for the greeting)", getattr(getattr(st, "context", None), "timezone", None) or "Asia/Kolkata", key="time_zone")
     if st.button("Sign in", type="primary", width="stretch") and state.user_id and state.workspace_id:
         listed = call("list_projects")
         if listed is not None:
@@ -381,46 +410,29 @@ with chat_tab:
         st.file_uploader("File or image", type=["pdf", "png", "jpg", "jpeg"], disabled=True, key="attachment")
         st.caption(f"{NOT_BUILT}.")
 
-    if not state.chat_id and not state.pending:
-        key = json.dumps(scope, sort_keys=True)
-        holder = st.empty()
-        shown = state.starters.get(key)
-        if shown is None:
-            # The backend answers at once with what it has (saved, older or built-in). Draw that, then
-            # ask for the written set and swap it in when it arrives.
-            ask = {"scope": scope, "entry_point": entry_point(scope), "time_zone": time_zone}
-            shown = call("get_starters", **ask)
-            if shown:
-                draw_starters(holder, shown["starters"], "quick")
-                if not shown.get("fresh", True):
-                    with st.spinner("Writing suggestions for you…"):
-                        written = call("get_starters", generate=True, **ask)
-                    if written:
-                        shown = written
-                        draw_starters(holder, written["starters"], "final")
-            state.starters[key] = shown
-        else:
-            draw_starters(holder, shown["starters"], "final")
-        if shown:
-            timings = shown.get("timings_ms") or {}
-            st.caption(f"Suggestions: {shown.get('source')} · {timings.get('total', '?')} ms")
-        if st.button("Refresh suggestions"):
-            state.starters.pop(key, None)
-            st.rerun()
-
-    for index, message in enumerate(state.messages):
-        with st.chat_message(message["role"]):
-            if message["role"] == "user":
-                st.markdown(message.get("content", ""))
-            else:
-                for notice in message.get("notices", []):
-                    draw_notice(notice)
-                last = index == len(state.messages) - 1 and not state.pending
-                draw_blocks(message.get("blocks", []), message.get("citations", []), f"m{index}", live=last)
-
+    # The areas are laid out first and filled once we know whether a question is on its way, so the
+    # suggestions never stay on screen (greyed out) underneath an answer that is being written.
+    starters_area = st.container()
+    history_area = st.container()
     typed = st.chat_input(f"Ask about {scope_label(scope)}")
     question = state.pending or typed
+
+    if not state.chat_id and not question:
+        with starters_area:
+            show_starters(scope)
+
+    with history_area:
+        for index, message in enumerate(state.messages):
+            with st.chat_message(message["role"]):
+                if message["role"] == "user":
+                    st.markdown(message.get("content", ""))
+                else:
+                    for notice in message.get("notices", []):
+                        draw_notice(notice)
+                    last = index == len(state.messages) - 1
+                    draw_blocks(message.get("blocks", []), message.get("citations", []), f"m{index}", live=last and not question)
+        if question:
+            state.pending = None
+            run_turn(question, scope)
     if question:
-        state.pending = None
-        run_turn(question, scope)
         st.rerun()
