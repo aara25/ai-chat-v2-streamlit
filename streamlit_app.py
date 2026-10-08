@@ -29,7 +29,7 @@ NOTICE_STYLE = {"error": st.error, "notfound": st.warning, "partial": st.warning
 
 st.set_page_config(page_title="Looppanel AI chat", page_icon="💬", layout="wide")
 state = st.session_state
-for key, default in {"signed_in": False, "projects": [], "chat_id": None, "messages": [], "pending": None, "starters": {}, "files": {}}.items():
+for key, default in {"signed_in": False, "projects": [], "chat_id": None, "messages": [], "pending": None, "starters": {}, "files": {}, "refresh_keys": {}}.items():
     state.setdefault(key, default)
 
 
@@ -209,48 +209,68 @@ def draw_blocks(blocks: list, citations: list, key: str, live: bool) -> None:
                     st.rerun()
 
 
-def draw_starters(holder, starters: dict, stage: str) -> None:
-    """The greeting, the opener and the question buttons. The quick set and the written set get different
-    button ids so both can be drawn in one run; each id is the same on every run, so a click is never lost."""
+def draw_starters(holder, starters: dict, note: str = "") -> None:
+    """The greeting, the opener and the question buttons. Button ids are the same on every run, so a click is never lost."""
     with holder.container():
         st.header(starters.get("greeting") or "Hello")
         if starters.get("opener"):
             st.write(starters["opener"])
         for index, item in enumerate(starters["items"]):
-            if st.button(item["question"], key=f"starter-{stage}-{index}"):
+            if st.button(item["question"], key=f"starter-{index}"):
                 state.pending = item["question"]
                 st.rerun()
             if item.get("article_url"):
                 st.caption(f"[Help article]({item['article_url']})")
+        if note:
+            st.caption(note)
+
+
+def request_refresh(key: str) -> None:
+    state.refresh_keys[key] = True
 
 
 def show_starters(scope: list) -> None:
-    """The greeting and the suggested questions for the selection."""
+    """The greeting and the suggested questions for the selection.
+
+    The backend answers at once from a pool the model wrote ahead of time; opening shows the same
+    questions as last time and Refresh shows ones not seen before. When the pool is missing or running
+    low, the page asks the backend to write more after it has drawn what it has, so it never waits."""
     key = json.dumps(scope, sort_keys=True)
     holder = st.empty()
+    ask = {"scope": scope, "entry_point": entry_point(scope), "time_zone": state.time_zone}
+    refresh = state.refresh_keys.pop(key, False)
     shown = state.starters.get(key)
-    if shown is None:
-        # The backend answers at once with what it has (saved, older or built-in). Draw that, then
-        # ask for the written set and swap it in when it arrives.
-        ask = {"scope": scope, "entry_point": entry_point(scope), "time_zone": state.time_zone}
-        shown = call("get_starters", **ask)
-        if shown:
-            draw_starters(holder, shown["starters"], "quick")
-            if not shown.get("fresh", True):
-                with st.spinner("Writing suggestions for you…"):
-                    written = call("get_starters", generate=True, **ask)
-                if written:
-                    shown = written
-                    draw_starters(holder, written["starters"], "final")
+    if shown is None or refresh:
+        shown = call("get_starters", refresh=refresh, **ask)
         state.starters[key] = shown
+        if not shown:
+            return
+        items_on_screen = shown["starters"]["items"]
+        note = "That is everything for now. More ideas are on the way." if shown.get("exhausted") else ""
+        if items_on_screen:
+            draw_starters(holder, shown["starters"], note)
+        else:
+            with holder.container():
+                st.caption("Writing suggestions for you…")
+        if shown.get("more_coming") or not items_on_screen:
+            written = call("get_starters", generate=True, **ask)
+            if written and not items_on_screen:
+                shown = written
+                state.starters[key] = shown
+                if shown["starters"]["items"]:
+                    draw_starters(holder, shown["starters"])
+                else:
+                    with holder.container():
+                        st.caption("Suggestions are unavailable right now. You can still ask a question below.")
+            elif written:
+                state.starters[key] = {**shown, "more_coming": written["more_coming"]}
     else:
-        draw_starters(holder, shown["starters"], "final")
+        draw_starters(holder, shown["starters"])
+    shown = state.starters.get(key)
     if shown:
         timings = shown.get("timings_ms") or {}
         st.caption(f"Suggestions: {shown.get('source')} · {timings.get('total', '?')} ms")
-    if st.button("Refresh suggestions"):
-        state.starters.pop(key, None)
-        st.rerun()
+        st.button("Refresh suggestions", on_click=request_refresh, args=(key,))
 
 
 def draw_notice(notice: dict) -> None:
