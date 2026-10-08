@@ -209,6 +209,22 @@ def draw_blocks(blocks: list, citations: list, key: str, live: bool) -> None:
                     st.rerun()
 
 
+def draw_starters(holder, starters: dict, stage: str) -> None:
+    """The greeting, the opener and the question buttons. The quick set and the written set get different
+    button ids so both can be drawn in one run; each id is the same on every run, so a click is never lost."""
+    with holder.container():
+        st.header(starters.get("greeting") or "Hello")
+        if starters.get("opener"):
+            st.write(starters["opener"])
+        for index, item in enumerate(starters["items"]):
+            label = ("❓ " if item.get("kind") == "how_to" else "") + item["question"]
+            if st.button(label, key=f"starter-{stage}-{index}"):
+                state.pending = item["question"]
+                st.rerun()
+            if item.get("article_url"):
+                st.caption(f"Help article: {item['article_url']}")
+
+
 def draw_notice(notice: dict) -> None:
     NOTICE_STYLE.get(notice["kind"], st.info)(notice["text"])
 
@@ -367,22 +383,27 @@ with chat_tab:
 
     if not state.chat_id and not state.pending:
         key = json.dumps(scope, sort_keys=True)
-        if key not in state.starters:
-            with st.spinner("Preparing suggestions…"):
-                data = call("get_starters", scope=scope, entry_point=entry_point(scope), time_zone=time_zone)
-            state.starters[key] = data["starters"] if data else None
-        starters = state.starters[key]
-        if starters:
-            st.header(starters.get("greeting") or "Hello")
-            if starters.get("opener"):
-                st.write(starters["opener"])
-            for index, item in enumerate(starters["items"]):
-                label = ("❓ " if item.get("kind") == "how_to" else "") + item["question"]
-                if st.button(label, key=f"starter-{index}"):
-                    state.pending = item["question"]
-                    st.rerun()
-                if item.get("article_url"):
-                    st.caption(f"Help article: {item['article_url']}")
+        holder = st.empty()
+        shown = state.starters.get(key)
+        if shown is None:
+            # The backend answers at once with what it has (saved, older or built-in). Draw that, then
+            # ask for the written set and swap it in when it arrives.
+            ask = {"scope": scope, "entry_point": entry_point(scope), "time_zone": time_zone}
+            shown = call("get_starters", **ask)
+            if shown:
+                draw_starters(holder, shown["starters"], "quick")
+                if not shown.get("fresh", True):
+                    with st.spinner("Writing suggestions for you…"):
+                        written = call("get_starters", generate=True, **ask)
+                    if written:
+                        shown = written
+                        draw_starters(holder, written["starters"], "final")
+            state.starters[key] = shown
+        else:
+            draw_starters(holder, shown["starters"], "final")
+        if shown:
+            timings = shown.get("timings_ms") or {}
+            st.caption(f"Suggestions: {shown.get('source')} · {timings.get('total', '?')} ms")
         if st.button("Refresh suggestions"):
             state.starters.pop(key, None)
             st.rerun()
